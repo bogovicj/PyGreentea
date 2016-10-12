@@ -328,7 +328,31 @@ def implement_usknet(bottom, netconf, unetconf, return_blobs_only=True):
         return blobs[-1]
     else:
         return blobs[-1], fmaps[-1]
+
+def buildGraph( net, source_layers ):
+
+    graph = Graph()
     
+    # Resolve the source layer functions
+    for i in range(0, len(source_layers)):
+        if (type(source_layers[i]) == net_spec.Top):
+            source_layers[i] = source_layers[i].fn
+
+    for name, top in six.iteritems(net.tops):
+        if (isinstance(top, Iterable) and len(top) > 0):
+            for subtop in top:
+                graph.add_element(subtop)
+        else:
+            graph.add_element(top)
+
+    print("Net explicit elements: " + str(len(net.tops)))
+    print("Graph nodes: " + str(len(graph.nodes)))
+    print("Graph edges: " + str(len(graph.edges)))
+    print("Source nodes: " + str(len(graph.get_source_nodes())))
+    print("Sink nodes: " + str(len(graph.get_sink_nodes())))
+
+    return graph
+
 def fix_input_dims(net, source_layers, max_shapes=[], shape_coupled=[], phase=None, stage=None):
     """
     This function takes as input:
@@ -832,3 +856,153 @@ def equal_shape(shape_A, shape_B):
     return equal
 
 metalayers = MetaLayers()
+
+
+def getBlobsToAddLoss( top ):
+    out = []
+    if( top.fn.type_name == 'Deconvolution' ):
+        for t in top.fn.inputs:
+            if( t.fn.type_name == 'ReLU' ):
+                out = out + [t]
+                out = out + getBlobsToAddLoss(t)
+    else:
+        for t in top.fn.inputs:
+            out = out + getBlobsToAddLoss(t)
+
+    return out
+
+def addLoss( net, top, netconf, num_output, in_size, suffix, is_train=True ):
+
+    if is_train:
+        label, labeli = L.MemoryData( dim=in_size, ntop=2, include=dict(phase=caffe.TRAIN))
+        scale, scalei = L.MemoryData( dim=in_size, ntop=2, include=dict(phase=caffe.TRAIN))
+        silence = L.Silence( labeli, scalei, ntop=0, include=dict(phase=caffe.TRAIN))
+
+        net.__setitem__( 'scale_' + suffix, scale )
+        net.__setitem__( 'scalei_' + suffix, scalei )
+        net.__setitem__( 'label_' + suffix, label )
+        net.__setitem__( 'labeli_' + suffix, labeli )
+        net.__setitem__( 'silence_' + suffix, silence )
+
+    out = L.Convolution( top, kernel_size=[1], num_output=num_output,
+            weight_filler=dict(type='msra'),
+            bias_filler=dict(type='constant'))
+
+    net.__setitem__( 'out_' + suffix, out )
+
+    if is_train:
+        loss = L.EuclideanLoss( out, label, scale, ntop=0, include=dict(phase=caffe.TRAIN))
+        net.__setitem__( 'loss_' + suffix, loss )
+
+
+def back_unconv_undeconv( im_in, nconvs=1 ):
+        nd = len( im_in.shape )
+        pad_param = [ (nconvs,nconvs) if i > 0 else (0,0) for i in range(0,nd)]
+        ds_param = [ 2 if i > 0 else 1 for i in range(0,nd)]
+        im_in_pad = np.pad( im_in, pad_param, 'edge' )
+        return block_reduce( im_in_pad, block_size=tuple(ds_param), func=np.mean)
+
+def addLossAndDownsample( net, top, netconf, num_output, in_size, suffix,
+                        is_train=True, use_conv=False,
+                        blobs_to_downsample={'label':'label', 'scale':'scale'},
+                        kernel_size=[2], stride=[2]):
+    """ Adds a multi-res loss-layer and downsamples the truth.
+
+    Takes the input blobs specified by blobs_to_downsample, and
+    downsamples / and or crops them so that it is of a shape comparable
+    to the output at this resolution.
+    """
+
+    new_label_name = None
+    new_scale_name = None
+
+    if is_train:
+        label_name = blobs_to_downsample['label']
+        scale_name = blobs_to_downsample['scale']
+
+        label = net.__getattr__( label_name )
+        scale = net.__getattr__( scale_name )
+
+        if use_conv:
+            label_down = L.Convolution( label, kernel_size=kernel_size, stride=stride, pad=[0],
+                            group=num_output, param=[dict(lr_mult=0)],
+                            weight_filler=dict(type='constant',value=1),
+                            bias_filler=dict(type='constant',value=0),
+                            include=dict(phase=caffe.TRAIN))
+            scale_down = L.Convolution( scale, kernel_size=kernel_size, stride=stride, pad=[0],
+                            group=num_output, param=[dict(lr_mult=0)],
+                            weight_filler=dict(type='constant',value=1),
+                            bias_filler=dict(type='constant',value=0),
+                            include=dict(phase=caffe.TRAIN))
+        else:
+            label_down = L.Pooling( label, pool=P.Pooling.AVE, kernel_size=kernel_size, stride=stride, pad=[0], dilation=[1])
+            scale_down = L.Pooling( scale, pool=P.Pooling.AVE, kernel_size=kernel_size, stride=stride, pad=[0], dilation=[1])
+
+        new_label_name = 'label_' + suffix
+        new_scale_name = 'scale_' + suffix
+
+        net.__setitem__( new_label_name, label_down )
+        net.__setitem__( new_scale_name, scale_down )
+
+    out = L.Convolution( top, kernel_size=[1], num_output=num_output,
+            weight_filler=dict(type='msra'),
+            bias_filler=dict(type='msra'),
+            include=dict(phase=caffe.TRAIN))
+
+    net.__setitem__( 'out_' + suffix, out )
+
+    if is_train:
+        loss = L.EuclideanLoss( out, label_down, scale_down, ntop=0, include=dict(phase=caffe.TRAIN))
+        net.__setitem__( 'loss_' + suffix, loss )
+
+    return {'label':new_label_name, 'scale':new_scale_name}
+
+
+def addMultiResAndDownsample( net, netconf, output_sz, suffix='ds', is_train=True ):
+
+    addus = netgen.getBlobsToAddLoss( net.unet )
+    print( 'going to add ', len( addus), ' loss layers')
+    ds_sz = output_sz
+    testim = np.zeros( tuple(ds_sz))
+    nout = output_sz[1]
+
+    thissuffix = suffix
+    for t in addus:
+        testim = netgen.back_unconv_undeconv( testim )
+        print( 'adding loss of shape: ', testim.shape, ' with suffix ',
+                thissuffix)
+        addLossAndDownsample( net, t, netconf, nout, list( testim.shape ), thissuffix, is_train=is_train )
+        thissuffix = thissuffix + '_' + suffix
+
+def addMultiRes( net, netconf, output_sz, suffix='ds', is_train=True,
+        use_downsample_layer=False,
+        use_conv=False):
+
+    addus = getBlobsToAddLoss( net.unet )
+    print( 'going to add ', len( addus), ' loss layers')
+    if use_downsample_layer:
+        if use_conv:
+            print( '  with convolution downsampling ' )
+        else:
+            print( '  without convolution downsampling ' )
+
+    ds_sz = output_sz
+    testim = np.zeros( tuple(ds_sz))
+    nout = output_sz[1]
+
+    this_label_name = 'label'
+    this_scale_name = 'scale'
+
+    thissuffix = suffix
+    for t in addus:
+        print( dir(t))
+        print( t.name )
+        testim = back_unconv_undeconv( testim )
+        print( 'adding loss of shape: ', testim.shape, ' with suffix ',
+                thissuffix)
+        if use_downsample_layer:
+            addLossAndDownsample( net, t, netconf, nout, list( testim.shape ), thissuffix, is_train=is_train,
+                    use_conv=use_conv )
+        else:
+            addLoss( net, t, netconf, nout, list( testim.shape ), thissuffix, is_train=is_train )
+        thissuffix = thissuffix + '_' + suffix
